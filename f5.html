@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+  <title>نظام حضور وانصراف – الإصدار النهائي المتكامل</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+  <script src="https://cdn.jsdelivr.net/npm/apexcharts"></script>
+  <script src="https://cdn.sheetjs.com/xlsx-0.20.1/package/dist/xlsx.full.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    * { font-family: 'Cairo', sans-serif; }
+    .spinner { border: 3px solid rgba(255,255,255,0.3); border-radius: 50%; border-top: 3px solid #2563eb; width: 24px; height: 24px; animation: spin 0.8s linear infinite; display: inline-block; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    body.dark-mode { background-color: #0f172a; color: #e2e8f0; }
+    body.dark-mode .bg-white { background-color: #1e293b !important; color: #f1f5f9 !important; }
+    body.dark-mode .bg-gray-100 { background-color: #0f172a !important; }
+    body.dark-mode .bg-gray-50 { background-color: #1e293b !important; }
+    body.dark-mode .border, body.dark-mode .border-b { border-color: #334155 !important; }
+    body.dark-mode input, body.dark-mode select, body.dark-mode textarea { background-color: #334155; color: #f1f5f9; border-color: #475569; }
+    body.dark-mode input::placeholder, body.dark-mode select::placeholder { color: #94a3b8; }
+    body.dark-mode table thead { background-color: #1e293b !important; }
+    body.dark-mode table tbody tr:hover { background-color: #334155 !important; }
+    body.dark-mode header { background: linear-gradient(to left, #1e3a8a, #1e40af) !important; }
+    header { z-index: 50 !important; }
+    .sticky-tabs { position: sticky; top: 80px; z-index: 40 !important; }
+    .chart-container { overflow: hidden; }
+  </style>
+</head>
+<body class="bg-gray-100 min-h-screen">
+  <div id="app"></div>
+  <script>
+    // ============================================================
+    // CONFIG
+    // ============================================================
+    const API = 'https://script.google.com/macros/s/AKfycbyLhFD_71tOiWmIh-mh_UdcEluFctt777gN9dXTeIr0HB622lIu2q8GzJROrtx7i-Ylvg/exec';
+    const STATUSES = ['حاضر','غائب','إجازة','مأمورية','مرضي','متأخر','تصفية','منقطع'];
+    const SHIFTS = ['صباحي','مسائي','1','2','3','4','5','بدون'];
+    const PERMS = { EDIT:'تعديل_الموظفين', STATUS:'تغيير_الحالة', EXPORT:'تصدير', LOGS:'مشاهدة_السجلات', UNITS:'إدارة_الوحدات', ALL:'كل_الصلاحيات' };
+
+    let user = null, employees = [], units = [];
+    let activeTab = 'employees';
+    let filterStatus = 'الكل', filterDepartment = 'الكل', filterShift = 'الكل', searchTerm = '';
+    let darkMode = false, chart = null;
+    let loading = { login:false, employees:false, action:false, export:false };
+    let lastError = '';
+    let checkInterval = null;
+    let focusedElementId = null, selectionStart = 0, selectionEnd = 0;
+
+    // ============================================================
+    // HELPERS
+    // ============================================================
+    const saveFocus = () => {
+      const el = document.activeElement;
+      if (el && el.id) {
+        focusedElementId = el.id;
+        if (el.selectionStart !== undefined) {
+          selectionStart = el.selectionStart;
+          selectionEnd = el.selectionEnd;
+        }
+      } else focusedElementId = null;
+    };
+    const restoreFocus = () => {
+      if (focusedElementId) {
+        const el = document.getElementById(focusedElementId);
+        if (el && el.focus) {
+          el.focus();
+          if (el.setSelectionRange && selectionStart !== undefined) el.setSelectionRange(selectionStart, selectionEnd);
+        }
+        focusedElementId = null;
+      }
+    };
+    const esc = str => str?.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') || '';
+    const toast = (msg, err=false) => {
+      let el = document.getElementById('toast');
+      if(!el){ el=document.createElement('div'); el.id='toast'; el.className='fixed bottom-5 left-1/2 -translate-x-1/2 px-6 py-3 rounded-full text-sm z-50 transition-all duration-300 opacity-0'; document.body.appendChild(el); }
+      el.textContent = msg; el.style.backgroundColor = err ? '#dc2626' : '#10b981';
+      el.classList.add('opacity-100'); clearTimeout(el.timer); el.timer = setTimeout(()=> el.classList.remove('opacity-100'), 3000);
+    };
+    const perm = p => user && (user.role==='super_admin' || user.permissions?.includes(PERMS.ALL) || user.permissions?.includes(p));
+    const shouldSeeAllEmployees = () => user.role === 'super_admin' || perm(PERMS.STATUS) || perm(PERMS.EXPORT) || perm(PERMS.LOGS);
+    const canSetTerminated = () => user.role === 'super_admin' || perm(PERMS.EDIT) || perm(PERMS.ALL);
+    const allowedStatuses = () => canSetTerminated() ? STATUSES : STATUSES.filter(s => s !== 'تصفية' && s !== 'منقطع');
+
+    // ============================================================
+    // API
+    // ============================================================
+    const api = async (action, method='GET', body=null, params={}) => {
+      let url = `${API}?action=${action}`;
+      if(method==='GET') Object.entries(params).forEach(([k,v])=> url += `&${k}=${encodeURIComponent(v)}`);
+      const options = { method, headers:{} };
+      if(method==='POST' && body) { options.headers['Content-Type']='text/plain'; options.body = JSON.stringify(body); }
+      const res = await fetch(url, options);
+      if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      const data = await res.json();
+      if(!data.success) throw new Error(data.error);
+      return data.data;
+    };
+
+    const refresh = async (showSpinner=true) => {
+      if(!user) return;
+      if(showSpinner) loading.employees = true;
+      lastError = '';
+      render();
+      try {
+        const unitParam = shouldSeeAllEmployees() ? 'all' : user.unitId;
+        employees = await api('employees', 'GET', null, {unitId: unitParam});
+        if(user.role==='super_admin') units = await api('units');
+      } catch(e) { lastError = e.message; toast(e.message, true); }
+      finally { loading.employees = false; render(); }
+    };
+    const filtered = () => {
+      let res = [...employees];
+      if(filterStatus!=='الكل') res = res.filter(e=>e.status===filterStatus);
+      if(filterDepartment!=='الكل') res = res.filter(e=>e.department===filterDepartment);
+      if(filterShift!=='الكل') res = res.filter(e=>e.shift===filterShift);
+      if(searchTerm.trim()) res = res.filter(e=>e.name.toLowerCase().includes(searchTerm.trim().toLowerCase()));
+      return res;
+    };
+    const departments = () => [...new Set(employees.map(e=>e.department?.trim()).filter(Boolean))].sort();
+    const uniqueShifts = () => [...new Set(employees.map(e=>e.shift?.trim()).filter(Boolean))].sort();
+
+    // ============================================================
+    // MODALS
+    // ============================================================
+    function openModal(content, onMount=()=>{}){
+      const overlay = document.createElement('div');
+      overlay.className = 'modal-overlay fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50';
+      overlay.innerHTML = content;
+      document.body.appendChild(overlay);
+      overlay.addEventListener('click', e => e.target===overlay && overlay.remove());
+      document.addEventListener('keydown', e => e.key==='Escape' && overlay.remove());
+      onMount(overlay);
+      return overlay;
+    }
+
+    function employeeModal(emp=null){
+      const isEdit = !!emp;
+      const depts = departments();
+      let deptOptions = depts.map(d=>`<option value="${esc(d)}" ${emp?.department===d?'selected':''}>${esc(d)}</option>`).join('');
+      deptOptions += `<option value="__NEW__">➕ إضافة قسم جديد</option>`;
+      const unitSelect = user.role==='super_admin' && units.length ? `<label>الوحدة</label><select id="mUnit" class="border p-2 rounded w-full mb-2">${units.map(u=>`<option value="${u.id}" ${emp?.unitId==u.id?'selected':''}>${u.name}</option>`).join('')}</select>` : '';
+      const html = `
+        <div class="bg-white rounded-xl p-6 max-w-lg w-full mx-4">
+          <h3 class="text-lg font-bold mb-4">${isEdit?'تعديل موظف':'إضافة موظف'}</h3>
+          <label>الكود</label><input type="number" id="mId" value="${esc(emp?.id||'')}" ${isEdit?'disabled':''} class="border p-2 rounded w-full mb-2" />
+          <label>الاسم</label><input type="text" id="mName" value="${esc(emp?.name||'')}" class="border p-2 rounded w-full mb-2" /><div id="mWarn" class="text-yellow-600 text-sm mb-2 hidden"></div>
+          ${unitSelect}
+          <label>القسم</label><select id="mDept" class="border p-2 rounded w-full mb-2">${deptOptions}</select>
+          <div id="mDeptNewWrap" style="display:none" class="mb-2"><label>اسم القسم الجديد</label><input id="mDeptNew" class="border p-2 rounded w-full" /></div>
+          <label>الوردية</label><select id="mShift" class="border p-2 rounded w-full mb-2">${SHIFTS.map(s=>`<option value="${s}" ${emp?.shift===s?'selected':''}>${s}</option>`).join('')}</select>
+          <label>ملاحظات</label><input id="mNotes" value="${esc(emp?.notes||'')}" class="border p-2 rounded w-full mb-2" />
+          <label>الحالة</label><select id="mStatus" class="border p-2 rounded w-full mb-4">${STATUSES.map(s=>`<option ${emp?.status===s?'selected':''}>${s}</option>`).join('')}</select>
+          <div class="flex justify-end gap-2"><button id="mCancel" class="px-4 py-2 border rounded-lg">إلغاء</button><button id="mSave" class="px-4 py-2 bg-blue-600 text-white rounded-lg">حفظ</button></div>
+        </div>`;
+      openModal(html, overlay=>{
+        const deptSel = overlay.querySelector('#mDept');
+        const newWrap = overlay.querySelector('#mDeptNewWrap');
+        deptSel.onchange = ()=> newWrap.style.display = deptSel.value==='__NEW__'?'block':'none';
+        if(isEdit && emp.department && depts.includes(emp.department)){ deptSel.value = emp.department; newWrap.style.display = 'none'; }
+        else if(isEdit && emp.department){ const opt = document.createElement('option'); opt.value=emp.department; opt.textContent=emp.department; opt.selected=true; deptSel.insertBefore(opt, deptSel.lastElementChild); newWrap.style.display = 'none'; }
+        overlay.querySelector('#mName').oninput = function(){
+          const val = this.value.trim().toLowerCase();
+          const warn = overlay.querySelector('#mWarn');
+          if(val.length<=2){ warn.classList.add('hidden'); return; }
+          const similar = employees.filter(e => (isEdit?e.id!==emp.id:true) && e.name.toLowerCase().includes(val));
+          if(similar.length){ warn.classList.remove('hidden'); warn.textContent = `⚠️ أسماء متشابهة: ${similar.map(s=>s.name).join(', ')}`; }
+          else warn.classList.add('hidden');
+        };
+        overlay.querySelector('#mCancel').onclick = ()=> overlay.remove();
+        overlay.querySelector('#mSave').onclick = async ()=>{
+          let dept = deptSel.value;
+          if(dept==='__NEW__'){ const newVal = overlay.querySelector('#mDeptNew').value.trim(); if(!newVal) return toast('أدخل اسم القسم', true); dept = newVal; }
+          const data = {
+            id: overlay.querySelector('#mId').value.trim(),
+            name: overlay.querySelector('#mName').value.trim(),
+            unitId: user.role==='super_admin'? (overlay.querySelector('#mUnit')?.value||user.unitId) : user.unitId,
+            department: dept, shift: overlay.querySelector('#mShift').value,
+            notes: overlay.querySelector('#mNotes').value.trim(),
+            status: overlay.querySelector('#mStatus').value,
+          };
+          if(!data.id||!data.name) return toast('الكود والاسم مطلوبان', true);
+          if(!/^\d+$/.test(data.id)) return toast('الكود أرقام فقط', true);
+          if(employees.find(e=>e.id===data.id && (!isEdit||e.id!==emp.id))) return toast('الكود موجود مسبقاً', true);
+          overlay.remove();
+          loading.action = true; render();
+          try {
+            if(isEdit) await api('update-employee','POST',{...data, adminId:user.unitId, adminName:user.username});
+            else await api('add-employee','POST',{...data, adminId:user.unitId, adminName:user.username});
+            await refresh(false);
+            toast(isEdit?'تم التعديل':'تمت الإضافة');
+          } catch(e) { toast(e.message, true); }
+          finally { loading.action = false; render(); }
+        };
+      });
+    }
+
+    function unitModal(unit=null){
+      const isEdit = !!unit;
+      const html = `
+        <div class="bg-white rounded-xl p-6 max-w-md w-full mx-4">
+          <h3 class="text-lg font-bold mb-4">${isEdit?'تعديل':'إضافة'} وحدة</h3>
+          <label>الاسم</label><input id="uName" value="${esc(unit?.name||'')}" class="border p-2 rounded w-full mb-2" />
+          <label>المستخدم</label><input id="uUser" value="${esc(unit?.username||'')}" class="border p-2 rounded w-full mb-2" />
+          <label>كلمة المرور</label><input id="uPass" type="text" value="${esc(unit?.password||'')}" class="border p-2 rounded w-full mb-2" />
+          <label>الدور</label><select id="uRole" class="border p-2 rounded w-full mb-4"><option value="unit_admin" ${unit?.role==='unit_admin'?'selected':''}>مشرف وحدة</option><option value="super_admin" ${unit?.role==='super_admin'?'selected':''}>مشرف عام</option></select>
+          <div class="flex justify-end gap-2"><button id="uCancel" class="px-4 py-2 border rounded-lg">إلغاء</button><button id="uSave" class="px-4 py-2 bg-blue-600 text-white rounded-lg">${isEdit?'تحديث':'إضافة'}</button></div>
+        </div>`;
+      openModal(html, overlay=>{
+        overlay.querySelector('#uCancel').onclick = ()=> overlay.remove();
+        overlay.querySelector('#uSave').onclick = async ()=>{
+          const data = { id:unit?.id, name:overlay.querySelector('#uName').value.trim(), username:overlay.querySelector('#uUser').value.trim(), password:overlay.querySelector('#uPass').value.trim(), role:overlay.querySelector('#uRole').value };
+          if(!data.name||!data.username||!data.password) return toast('جميع الحقول مطلوبة', true);
+          overlay.remove();
+          loading.action = true; render();
+          try {
+            if(isEdit) await api('update-unit','POST',{...data, adminId:user.unitId, adminName:user.username});
+            else await api('add-unit','POST',{...data, adminId:user.unitId, adminName:user.username});
+            await refresh(false);
+            toast(isEdit?'تم التحديث':'تمت الإضافة');
+          } catch(e) { toast(e.message, true); }
+          finally { loading.action = false; render(); }
+        };
+      });
+    }
+
+    function permModal(unit){
+      const isSelf = (user.unitId === unit.id);
+      let active = unit.isActive !== false;
+      const toggleActive = () => {
+        if (isSelf && active) { toast('لا يمكنك تعطيل حسابك الحالي', true); return; }
+        active = !active;
+        const btn = document.getElementById('pToggle');
+        if (btn) { btn.textContent = active ? 'مفعل' : 'معطل'; btn.className = `px-3 py-1 rounded ${active ? 'bg-green-600 text-white' : 'bg-red-600 text-white'}`; }
+      };
+      const permItems = [
+        { key: PERMS.EDIT, label: 'إضافة/تعديل/حذف الموظفين' },
+        { key: PERMS.STATUS, label: 'تغيير حالة الحضور' },
+        { key: PERMS.EXPORT, label: 'تصدير Excel' },
+        { key: PERMS.LOGS, label: 'مشاهدة سجل التغييرات' },
+        { key: PERMS.UNITS, label: 'إدارة الوحدات' },
+      ];
+      const isAll = Array.isArray(unit.permissions) && unit.permissions.includes(PERMS.ALL);
+      const html = `
+        <div class="bg-white rounded-xl p-6 max-w-lg w-full mx-4">
+          <h3 class="text-lg font-bold mb-4">صلاحيات: ${esc(unit.name)} ${isSelf ? '(حسابك الحالي)' : ''}</h3>
+          <div class="mb-4 flex items-center gap-2"><span class="font-bold">تفعيل الحساب:</span><button id="pToggle" class="px-3 py-1 rounded ${active ? 'bg-green-600 text-white' : 'bg-red-600 text-white'}">${active ? 'مفعل' : 'معطل'}</button>${isSelf ? '<span class="text-red-500 text-xs">(لا يمكن تعطيل حسابك)</span>' : ''}</div>
+          <div class="mb-4"><p class="font-bold mb-2">الصلاحيات:</p>${permItems.map(p=>`<label class="flex items-center gap-2 mb-2 cursor-pointer"><input type="checkbox" class="perm-item" value="${p.key}" ${isAll || (Array.isArray(unit.permissions)&&unit.permissions.includes(p.key))?'checked':''} /> <span>${p.label}</span></label>`).join('')}
+          <label class="flex items-center gap-2 mt-2 cursor-pointer"><input type="checkbox" id="mPermAll" ${isAll?'checked':''} /> <span class="font-bold text-blue-600">كل الصلاحيات (مشرف عام)</span></label></div>
+          <div class="flex justify-end gap-2"><button id="mPermCancel" class="px-4 py-2 border rounded-lg">إلغاء</button><button id="mPermSave" class="px-4 py-2 bg-blue-600 text-white rounded-lg">حفظ</button></div>
+        </div>`;
+      openModal(html, overlay=>{
+        overlay.querySelector('#pToggle').onclick = toggleActive;
+        const allCheck = overlay.querySelector('#mPermAll');
+        allCheck.onchange = ()=> overlay.querySelectorAll('.perm-item').forEach(cb=> cb.checked = allCheck.checked);
+        overlay.querySelector('#mPermCancel').onclick = ()=> overlay.remove();
+        overlay.querySelector('#mPermSave').onclick = async ()=>{
+          let perms = allCheck.checked ? [PERMS.ALL] : Array.from(overlay.querySelectorAll('.perm-item:checked')).map(cb=>cb.value);
+          overlay.remove();
+          loading.action = true; render();
+          try {
+            await api('update-unit-permissions','POST',{unitId:unit.id, isActive:active, permissions:perms, adminId:user.unitId, adminName:user.username});
+            units = units.map(u=> u.id===unit.id ? {...u, isActive:active, permissions:perms} : u);
+            if (unit.id === user.unitId) { user.isActive = active; user.permissions = perms; localStorage.setItem('attendance_user', JSON.stringify(user)); }
+            render();
+            toast('تم تحديث الصلاحيات');
+          } catch(e) { toast(e.message, true); }
+          finally { loading.action = false; render(); }
+        };
+      });
+    }
+
+    function accountModal(){
+      const html = `
+        <div class="bg-white rounded-xl p-6 max-w-md w-full mx-4">
+          <h3 class="text-lg font-bold mb-4">إعدادات الحساب</h3>
+          <div class="mb-4"><label>اسم مستخدم جديد</label><input id="acNewUser" class="border p-2 rounded w-full" /></div>
+          <div class="mb-4"><label>كلمة المرور الحالية</label><input type="password" id="acConfirmPass" class="border p-2 rounded w-full" /></div>
+          <button id="acChangeUser" class="w-full bg-blue-600 text-white p-2 rounded mb-4">تغيير اسم المستخدم</button>
+          <hr class="my-4" />
+          <div class="mb-4"><label>كلمة المرور الحالية</label><input type="password" id="acOldPass" class="border p-2 rounded w-full" /></div>
+          <div class="mb-4"><label>الجديدة</label><input type="password" id="acNewPass1" class="border p-2 rounded w-full" /></div>
+          <div class="mb-4"><label>تأكيد الجديدة</label><input type="password" id="acNewPass2" class="border p-2 rounded w-full" /></div>
+          <button id="acChangePass" class="w-full bg-blue-600 text-white p-2 rounded">تغيير كلمة المرور</button>
+          <div class="flex justify-end mt-4"><button id="acClose" class="px-4 py-2 border rounded-lg">إغلاق</button></div>
+        </div>`;
+      openModal(html, overlay=>{
+        overlay.querySelector('#acClose').onclick = ()=> overlay.remove();
+        overlay.querySelector('#acChangeUser').onclick = async ()=>{
+          const nu = overlay.querySelector('#acNewUser').value.trim();
+          const pw = overlay.querySelector('#acConfirmPass').value;
+          if(!nu||!pw) return toast('جميع الحقول مطلوبة', true);
+          overlay.remove();
+          loading.action = true; render();
+          try {
+            await api('change-username','POST',{oldUsername:user.username, newUsername:nu, password:pw});
+            user.username = nu;
+            localStorage.setItem('attendance_user', JSON.stringify(user));
+            toast('تم تغيير الاسم، إعادة تحميل...');
+            setTimeout(()=> location.reload(), 2000);
+          } catch(e) { toast(e.message, true); }
+          finally { loading.action = false; render(); }
+        };
+        overlay.querySelector('#acChangePass').onclick = async ()=>{
+          const old = overlay.querySelector('#acOldPass').value;
+          const n1 = overlay.querySelector('#acNewPass1').value;
+          const n2 = overlay.querySelector('#acNewPass2').value;
+          if(!old||!n1) return toast('جميع الحقول مطلوبة', true);
+          if(n1!==n2) return toast('كلمتا المرور غير متطابقتين', true);
+          overlay.remove();
+          loading.action = true; render();
+          try { await api('change-password','POST',{username:user.username, oldPassword:old, newPassword:n1}); toast('تم تغيير كلمة المرور'); }
+          catch(e) { toast(e.message, true); }
+          finally { loading.action = false; render(); }
+        };
+      });
+    }
+
+    // ============================================================
+    // ACTIONS
+    // ============================================================
+    const loginAction = async () => {
+      if(loading.login) return;
+      const u = document.getElementById('loginUser')?.value.trim();
+      const p = document.getElementById('loginPass')?.value.trim();
+      if(!u||!p) return toast('أدخل اسم المستخدم وكلمة المرور', true);
+      loading.login = true; render();
+      try {
+        user = await api('login','POST',{username:u, password:p});
+        localStorage.setItem('attendance_user', JSON.stringify(user));
+        toast(`مرحباً ${user.unitName}`);
+        await refresh(true);
+        startCheck();
+      } catch(e) { toast(e.message, true); }
+      finally { loading.login = false; render(); }
+    };
+    const logout = () => {
+      localStorage.removeItem('attendance_user');
+      clearInterval(checkInterval);
+      user = null; employees = []; units = [];
+      render();
+    };
+    const startCheck = () => {
+      clearInterval(checkInterval);
+      checkInterval = setInterval(async ()=>{
+        if(!user) return;
+        try {
+          const unitData = await api('get-unit-permissions','GET',null,{unitId:user.unitId});
+          if (unitData) {
+            if (unitData.isActive === false) {
+              toast('تم تعطيل حسابك. سيتم تسجيل الخروج.', true);
+              setTimeout(()=>{ logout(); location.reload(); }, 2000);
+              return;
+            }
+            const currentPerms = (user.permissions || []).slice().sort().join(',');
+            const newPerms = (unitData.permissions || []).slice().sort().join(',');
+            if (currentPerms !== newPerms) {
+              toast('تم تحديث صلاحيات حسابك. الرجاء إعادة تسجيل الدخول.', true);
+              setTimeout(()=>{ logout(); location.reload(); }, 2000);
+            }
+          }
+        } catch(e) { /* ignore network errors */ }
+      }, 60000);
+    };
+    const exportExcel = async () => {
+      if(!perm(PERMS.EXPORT)) return toast('لا صلاحية', true);
+      const data = filtered();
+      if(!data.length) return toast('لا توجد بيانات', true);
+      loading.export = true; render();
+      try {
+        await refresh(false);
+        const fresh = filtered();
+        if(!fresh.length) return toast('لا توجد بيانات بعد التحديث', true);
+        const rows = fresh.map(e=>({الكود:e.id, الاسم:e.name, القسم:e.department||'', الوردية:e.shift||'', الحالة:e.status, الملاحظات:e.notes||'', 'آخر تحديث':e.lastUpdate||''}));
+        const ws = XLSX.utils.json_to_sheet(rows);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'الموظفين');
+        XLSX.writeFile(wb, `تقرير_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.xlsx`);
+        toast('تم التصدير');
+      } catch(e) { toast(e.message, true); }
+      finally { loading.export = false; render(); }
+    };
+
+    // ============================================================
+    // RENDER
+    // ============================================================
+    function render(){
+      saveFocus();
+      const app = document.getElementById('app');
+      if(!user) {
+        app.innerHTML = loginPage();
+        if (!app._loginEventsBound) {
+          document.addEventListener('click', loginPageClickHandler);
+          app._loginEventsBound = true;
+        }
+        return;
+      }
+      const fList = filtered();
+      const depts = departments();
+      const shifts = uniqueShifts();
+      const showUnits = user.role==='super_admin' || perm(PERMS.UNITS);
+      const showLogs = perm(PERMS.LOGS);
+
+      app.innerHTML = `
+        <header class="fixed top-0 left-0 right-0 z-50 bg-gradient-to-r from-blue-600 to-blue-800 text-white p-4 shadow-lg flex flex-wrap justify-between items-center">
+          <div><h1 class="text-xl font-bold"><i class="fas fa-clock ml-2"></i>نظام حضور وانصراف</h1><p class="text-sm">${esc(user.unitName)} ${user.role==='super_admin'?'(مشرف عام)':''}</p></div>
+          <div class="flex gap-2">
+            <button id="accountBtn" class="bg-white text-blue-600 px-3 py-1 rounded text-sm"><i class="fas fa-user-cog ml-1"></i>الحساب</button>
+            <button id="darkBtn" class="bg-white text-blue-600 px-3 py-1 rounded text-sm"><i class="fas fa-${darkMode?'sun':'moon'} ml-1"></i>${darkMode?'فاتح':'داكن'}</button>
+            <button id="logoutBtn" class="bg-white text-blue-600 px-4 py-2 rounded text-sm">تسجيل خروج</button>
+          </div>
+        </header>
+        <nav class="sticky-tabs flex border-b bg-white overflow-x-auto" style="top:80px; z-index:40;">
+          ${[
+            { id:'employees', label:'الموظفين' },
+            { id:'charts', label:'إحصائيات' },
+            ...(showUnits ? [{ id:'units', label:'الوحدات' }] : []),
+            ...(showLogs ? [{ id:'logs', label:'السجلات' }] : []),
+            ...(user.role==='super_admin' ? [{ id:'permstab', label:'الصلاحيات' }] : []),
+          ].map(t=> `<button data-tab="${t.id}" class="tab-btn px-6 py-2 font-medium transition ${activeTab===t.id?'border-b-2 border-blue-600 text-blue-600':'text-gray-600 hover:text-blue-600'}">${t.label}</button>`).join('')}
+        </nav>
+        <main class="p-4" style="margin-top: 140px;" id="main-content"></main>
+      `;
+      document.getElementById('darkBtn').onclick = ()=>{ darkMode=!darkMode; document.body.classList.toggle('dark-mode', darkMode); render(); };
+      document.getElementById('logoutBtn').onclick = logout;
+      document.getElementById('accountBtn').onclick = accountModal;
+      document.querySelectorAll('.tab-btn').forEach(btn => btn.onclick = ()=>{ activeTab = btn.dataset.tab; render(); });
+
+      const main = document.getElementById('main-content');
+      if(activeTab==='employees'){
+        let emptyMessage = '';
+        if (fList.length === 0) {
+          if (lastError) emptyMessage = `فشل تحميل الموظفين: ${lastError}`;
+          else if (employees.length === 0) emptyMessage = 'لا يوجد موظفون مسجلون بعد.';
+          else emptyMessage = 'لا توجد نتائج – جرّب تعديل الفلاتر';
+        }
+        main.innerHTML = `
+          <div class="flex flex-wrap justify-between items-center gap-4 mb-4">
+            <div class="flex gap-2 flex-wrap">
+              ${perm(PERMS.EDIT)?'<button id="addEmp" class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-lg"><i class="fas fa-plus"></i> إضافة</button>':''}
+              ${perm(PERMS.EXPORT)?`<button id="exportBtn" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg" ${loading.export?'disabled':''}>${loading.export?'<span class="spinner"></span>':'<i class="fas fa-file-excel"></i>'} تصدير</button>`:''}
+              <button id="refreshBtn" class="bg-gray-500 hover:bg-gray-600 text-white px-4 py-2 rounded-lg"><i class="fas fa-sync-alt"></i> تحديث</button>
+            </div>
+            <div class="flex gap-2 flex-wrap">
+              <input type="text" id="searchInput" placeholder="بحث بالاسم..." value="${esc(searchTerm)}" class="border p-2 rounded-lg w-44" />
+              <select id="deptFilter" class="border p-2 rounded-lg"><option value="الكل">كل الأقسام</option>${depts.map(d=>`<option value="${esc(d)}" ${filterDepartment===d?'selected':''}>${esc(d)}</option>`).join('')}</select>
+              <select id="shiftFilter" class="border p-2 rounded-lg"><option value="الكل">كل الورديات</option>${shifts.map(s=>`<option value="${esc(s)}" ${filterShift===s?'selected':''}>${esc(s)}</option>`).join('')}</select>
+              <select id="statusFilter" class="border p-2 rounded-lg"><option value="الكل">الكل</option>${STATUSES.map(s=>`<option value="${s}" ${filterStatus===s?'selected':''}>${s}</option>`).join('')}</select>
+            </div>
+          </div>
+          ${loading.employees ? '<div class="flex justify-center py-20"><div class="spinner" style="width:40px;height:40px;border-width:4px;"></div><span class="mr-3">جاري التحميل...</span></div>' : `
+            <div class="bg-white rounded-xl shadow overflow-auto">
+              <table class="w-full min-w-[1100px]">
+                <thead class="bg-gray-50"><tr><th class="px-4 py-3 text-right">الكود</th><th class="px-4 py-3 text-right">الاسم</th><th class="px-4 py-3 text-right">القسم</th><th class="px-4 py-3 text-right">الوردية</th><th class="px-4 py-3 text-right">ملاحظات</th><th class="px-4 py-3 text-right">الحالة</th><th class="px-4 py-3 text-right">آخر تحديث</th><th class="px-4 py-3 text-right">إجراءات</th></tr></thead>
+                <tbody>
+                  ${fList.length===0 ? `<tr><td colspan="8" class="text-center py-12 text-gray-500">${emptyMessage}</td></tr>` :
+                    fList.map(e=>{
+                      const locked = (e.status === 'تصفية' || e.status === 'منقطع');
+                      return `<tr class="border-b hover:bg-gray-50">
+                        <td class="px-4 py-4 font-mono">${e.id}</td><td class="px-4 py-4 font-medium">${esc(e.name)}</td><td class="px-4 py-4">${esc(e.department||'-')}</td><td class="px-4 py-4">${esc(e.shift||'-')}</td>
+                        <td class="px-4 py-4"><input data-id="${e.id}" value="${esc(e.notes||'')}" class="notes-input border rounded px-2 py-1 w-32" ${!perm(PERMS.EDIT)?'disabled':''} /></td>
+                        <td class="px-4 py-4"><span class="px-3 py-1 rounded-full text-sm ${({حاضر:'bg-green-100 text-green-800',غائب:'bg-red-100 text-red-800',إجازة:'bg-blue-100 text-blue-800',مأمورية:'bg-purple-100 text-purple-800',مرضي:'bg-orange-100 text-orange-800',متأخر:'bg-yellow-100 text-yellow-800',تصفية:'bg-gray-700 text-white',منقطع:'bg-gray-500 text-white'})[e.status]}">${e.status}</span></td>
+                        <td class="px-4 py-4 text-sm text-gray-500">${e.lastUpdate||''}</td>
+                        <td class="px-4 py-4"><div class="flex gap-2 items-center">
+                          ${perm(PERMS.STATUS)?`<select data-id="${e.id}" class="status-select border p-1 rounded text-sm" ${locked?'disabled':''} title="${locked?'لا يمكن تغيير حالة موظف تم تصفيته أو انقطاعه':''}">${allowedStatuses().map(s=>`<option ${e.status===s?'selected':''}>${s}</option>`).join('')}</select>`:''}
+                          ${perm(PERMS.EDIT)?`<button data-edit="${e.id}" class="text-blue-600 hover:text-blue-800"><i class="fas fa-edit"></i></button><button data-delete="${e.id}" class="text-red-600 hover:text-red-800"><i class="fas fa-trash-alt"></i></button>`:''}
+                        </div></td>
+                      </tr>`;
+                    }).join('')}
+                </tbody>
+              </table>
+            </div>
+            <div class="mt-2 text-sm text-gray-500">إجمالي: ${employees.length} – الظاهر: ${fList.length} – ${shouldSeeAllEmployees()? 'عرض جميع الموظفين' : `وحدة: ${user.unitName} (${user.unitId})`}</div>
+          `}
+        `;
+        document.getElementById('addEmp')?.addEventListener('click', ()=> employeeModal());
+        document.getElementById('exportBtn')?.addEventListener('click', exportExcel);
+        document.getElementById('refreshBtn')?.addEventListener('click', ()=> refresh());
+        const searchInput = document.getElementById('searchInput');
+        searchInput?.addEventListener('input', function() { searchTerm = this.value; clearTimeout(this._debounce); this._debounce = setTimeout(()=> { saveFocus(); render(); }, 200); });
+        document.getElementById('deptFilter').onchange = function(){ filterDepartment = this.value; render(); };
+        document.getElementById('shiftFilter').onchange = function(){ filterShift = this.value; render(); };
+        document.getElementById('statusFilter').onchange = function(){ filterStatus = this.value; render(); };
+        document.querySelectorAll('.notes-input').forEach(inp=> inp.onchange = ()=> api('update-notes','POST',{id:inp.dataset.id, notes:inp.value, adminId:user.unitId, adminName:user.username}).then(()=> refresh(false)).catch(e=>toast(e.message,true)));
+        document.querySelectorAll('.status-select').forEach(sel=> sel.onchange = ()=> api('update-status','POST',{id:sel.dataset.id, status:sel.value, adminId:user.unitId, adminName:user.username, reason:''}).then(()=> refresh(false)).catch(e=>toast(e.message,true)));
+        document.querySelectorAll('[data-edit]').forEach(b=> b.onclick = ()=>{ const emp = employees.find(e=>e.id===b.dataset.edit); if(emp) employeeModal(emp); });
+        document.querySelectorAll('[data-delete]').forEach(b=> b.onclick = ()=>{ if(confirm('حذف الموظف؟')) api('delete-employee','POST',{id:b.dataset.delete, adminId:user.unitId, adminName:user.username}).then(()=> refresh(false)).catch(e=>toast(e.message,true)); });
+      } else if(activeTab==='charts'){
+        main.innerHTML = `<div id="chartContainer" class="bg-white p-4 rounded-xl shadow chart-container" style="height:400px; overflow:hidden;"></div>`;
+        setTimeout(()=>{
+          const container = document.querySelector('#chartContainer');
+          if(!container || !window.ApexCharts) return;
+          if(chart) chart.destroy();
+          const stats = STATUSES.map(s=> ({name: s, value: employees.filter(e=>e.status===s).length}));
+          chart = new ApexCharts(container, {
+            chart: { type:'bar', height:350, background:darkMode?'#1e293b':'#fff', foreColor:darkMode?'#e2e8f0':'#333', fontFamily:'Cairo', events:{ dataPointSelection: (event, chartContext, config) => { filterStatus = config.w.config.xaxis.categories[config.dataPointIndex]; activeTab='employees'; render(); } } },
+            series:[{ name:'عدد الموظفين', data:stats.map(s=> s.value) }],
+            xaxis:{ categories:stats.map(s=> s.name) },
+            title:{ text:'توزيع حالات الموظفين', align:'center' },
+            colors:['#3b82f6'],
+            plotOptions:{ bar:{ borderRadius:4 } },
+            dataLabels:{ enabled:false },
+            theme:{ mode:darkMode?'dark':'light' }
+          });
+          chart.render();
+        }, 50);
+      } else if(activeTab==='units'){
+        main.innerHTML = `
+          <button id="addUnit" class="bg-green-600 text-white px-4 py-2 rounded-lg mb-4"><i class="fas fa-plus"></i> إضافة وحدة</button>
+          <div class="bg-white rounded-xl shadow overflow-auto"><table class="w-full min-w-[600px]"><thead class="bg-gray-50"><tr><th class="p-3">#</th><th class="p-3">الوحدة</th><th class="p-3">المستخدم</th><th class="p-3">الدور</th><th class="p-3">الحالة</th><th class="p-3">إجراءات</th></tr></thead><tbody>${units.map(u=>`<tr><td class="p-3">${u.id}</td><td class="p-3">${esc(u.name)}</td><td class="p-3">${esc(u.username)}</td><td class="p-3">${u.role==='super_admin'?'مشرف عام':'مشرف وحدة'}</td><td class="p-3"><span class="px-2 py-1 rounded-full text-xs ${u.isActive===false?'bg-red-100 text-red-800':'bg-green-100 text-green-800'}">${u.isActive===false?'معطل':'مفعل'}</span></td><td class="p-3"><button data-unit='${JSON.stringify(u)}' class="edit-unit bg-blue-500 text-white px-2 py-1 rounded">تعديل</button> <button data-delete-unit="${u.id}" class="bg-red-500 text-white px-2 py-1 rounded">حذف</button> <button data-perms='${JSON.stringify(u)}' class="bg-purple-500 text-white px-2 py-1 rounded">صلاحيات</button></td></tr>`).join('')}</tbody></table></div>`;
+        document.getElementById('addUnit').onclick = ()=> unitModal();
+        document.querySelectorAll('.edit-unit').forEach(b=> b.onclick = ()=> unitModal(JSON.parse(b.dataset.unit)));
+        document.querySelectorAll('[data-delete-unit]').forEach(b=> b.onclick = ()=>{ if(confirm('حذف الوحدة؟')) api('delete-unit','POST',{id:b.dataset.deleteUnit, adminId:user.unitId, adminName:user.username}).then(()=> refresh(false)).catch(e=>toast(e.message,true)); });
+        document.querySelectorAll('[data-perms]').forEach(b=> b.onclick = ()=> permModal(JSON.parse(b.dataset.perms)));
+      } else if(activeTab==='permstab'){
+        main.innerHTML = `<h3 class="text-lg font-bold mb-4">صلاحيات الوحدات</h3><div class="bg-white rounded-xl shadow overflow-auto"><table class="w-full min-w-[700px]"><thead class="bg-gray-50"><tr><th class="p-3">#</th><th class="p-3">الوحدة</th><th class="p-3">المستخدم</th><th class="p-3">الدور</th><th class="p-3">الحالة</th><th class="p-3">الصلاحيات</th><th class="p-3">إجراءات</th></tr></thead><tbody>${units.map(u=>`<tr><td class="p-3">${u.id}</td><td class="p-3">${esc(u.name)}</td><td class="p-3">${esc(u.username)}</td><td class="p-3">${u.role==='super_admin'?'مشرف عام':'مشرف وحدة'}</td><td class="p-3"><span class="px-2 py-1 rounded-full text-xs ${u.isActive===false?'bg-red-100 text-red-800':'bg-green-100 text-green-800'}">${u.isActive===false?'معطل':'مفعل'}</span></td><td class="p-3 text-sm">${u.permissions?.includes('كل_الصلاحيات')?'كل الصلاحيات':(u.permissions?.join(', ')||'لا شيء')}</td><td class="p-3"><button data-perms='${JSON.stringify(u)}' class="bg-blue-600 text-white px-3 py-1 rounded">تعديل</button></td></tr>`).join('')}</tbody></table></div>`;
+        document.querySelectorAll('[data-perms]').forEach(b=> b.onclick = ()=> permModal(JSON.parse(b.dataset.perms)));
+      } else if(activeTab==='logs'){
+        main.innerHTML = '<div id="logsContainer" class="bg-white p-4 rounded-xl shadow">جاري التحميل...</div>';
+        api('logs').then(logs=>{
+          document.getElementById('logsContainer').innerHTML = logs.length ? `<table class="w-full"><thead class="bg-gray-50"><tr><th class="p-2">التاريخ</th><th class="p-2">المشرف</th><th class="p-2">الموظف</th><th class="p-2">الإجراء</th><th class="p-2">السبب</th></tr></thead><tbody>${logs.map(l=>`<tr><td class="p-2">${l.timestamp}</td><td class="p-2">${esc(l.adminName)}</td><td class="p-2">${l.employeeId||'-'}</td><td class="p-2">${esc(l.action)}</td><td class="p-2">${esc(l.reason||'-')}</td></tr>`).join('')}</tbody></table>` : '<p class="text-center py-8 text-gray-500">لا توجد سجلات</p>';
+        }).catch(e=> document.getElementById('logsContainer').innerHTML = `<p class="text-red-600">${e.message}</p>`);
+      }
+      restoreFocus();
+    }
+
+    function loginPage(){
+      return `
+        <div class="min-h-screen flex items-center justify-center bg-gradient-to-r from-blue-600 to-blue-800">
+          <div class="bg-white rounded-2xl shadow-2xl p-8 w-full max-w-md">
+            <div class="text-center mb-6"><i class="fas fa-users text-5xl text-blue-600"></i><h2 class="text-2xl font-bold mt-2">نظام حضور وانصراف</h2><p class="text-gray-500 text-sm">تسجيل دخول المشرفين</p></div>
+            <input type="text" id="loginUser" placeholder="اسم المستخدم" class="w-full p-3 border rounded-lg mb-4" />
+            <div class="relative mb-6"><input type="password" id="loginPass" placeholder="كلمة المرور" class="w-full p-3 border rounded-lg" /><button type="button" id="togglePass" class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-blue-600"><i class="fas fa-eye"></i></button></div>
+            <button id="loginBtn" class="w-full bg-blue-600 text-white p-3 rounded-lg flex justify-center items-center gap-2" ${loading.login?'disabled':''}>${loading.login?'<span class="spinner"></span> جاري الدخول...':'دخول'}</button>
+          </div>
+        </div>`;
+    }
+
+    function loginPageClickHandler(e) {
+      if (e.target.id === 'loginBtn') loginAction();
+      if (e.target.id === 'togglePass' || e.target.parentElement?.id === 'togglePass') {
+        const inp = document.getElementById('loginPass');
+        const btn = document.getElementById('togglePass');
+        if (inp && btn) {
+          const hidden = inp.type === 'password';
+          inp.type = hidden ? 'text' : 'password';
+          btn.innerHTML = hidden ? '<i class="fas fa-eye-slash"></i>' : '<i class="fas fa-eye"></i>';
+        }
+      }
+    }
+
+    // ============================================================
+    // INIT
+    // ============================================================
+    (()=>{
+      const saved = localStorage.getItem('attendance_user');
+      if(saved){ try{ user = JSON.parse(saved); refresh(false); startCheck(); } catch(e){ user=null; } }
+      render();
+    })();
+  </script>
+</body>
+</html>
